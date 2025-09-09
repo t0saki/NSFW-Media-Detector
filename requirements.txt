@@ -5,6 +5,8 @@ torchvision>=0.10.0
 # Computer Vision
 opencv-python-headless>=4.5.0
 Pillow>=8.0.0
+pillow-heif
+pillow-avif-plugin
 
 # Machine Learning Models
 timm>=0.6.0

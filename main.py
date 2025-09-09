@@ -27,19 +27,12 @@ except ImportError:
 # the script will still run but will skip these file types.
 try:
     import pillow_heif
+    import pillow_avif
     pillow_heif.register_heif_opener()
     print("HEIC/HEIF support enabled.")
 except ImportError:
     print("Warning: `pillow-heif` not found. HEIC/HEIF files will raise an error on open.")
     print("To process them, run: pip install pillow-heif")
-
-try:
-    import pillow_avif
-    pillow_avif.register_avif_opener()
-    print("AVIF support enabled.")
-except ImportError:
-    print("Warning: `pillow-avif-plugin` not found. AVIF files will raise an error on open.")
-    print("To process them, run: pip install pillow-avif-plugin")
 # --- End of new code block ---
 
 
