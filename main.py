@@ -222,17 +222,21 @@ def _perform_video_analysis(video_path: str, detector: NsfwDetector) -> dict:
         if not cap.isOpened():
             print(f"Error: Could not open video file {video_path}")
             return {"path": video_path, "prob": -1.0}
+
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
         if total_frames < 1:
             return {"path": video_path, "prob": 0.0}
+
         num_samples = min(MAX_VIDEO_SAMPLES, max(
             MIN_VIDEO_SAMPLES, total_frames))
         start_frame = int(total_frames * 0.05)
         end_frame = int(total_frames * 0.95)
         if start_frame >= end_frame:
             start_frame, end_frame = 0, max(0, total_frames - 1)
+
         sample_indices = np.unique(np.linspace(
             start_frame, end_frame, num=num_samples, dtype=int))
+
         for frame_index in sample_indices:
             cap.set(cv2.CAP_PROP_POS_FRAMES, frame_index)
             ret, frame = cap.read()
@@ -278,11 +282,12 @@ def main():
                         help="Number of images to process in a single batch on the GPU.")
     parser.add_argument("--image-workers", type=int, default=4,
                         help="Number of CPU cores for parallel image loading. Set to 0 to disable.")
-    parser.add_argument("--workers", type=int, default=None,
+    parser.add_argument("--workers", type=int, default=8,
                         help="Number of CPU cores for parallel video processing. Defaults to all available cores. Set to 0 to disable.")
     parser.add_argument("--no-cuda", action="store_true",
                         help="Disable CUDA and force CPU usage.")
     args = parser.parse_args()
+
     start_time = time.time()
     device = torch.device("cuda" if torch.cuda.is_available()
                           and not args.no_cuda else "cpu")
@@ -327,7 +332,6 @@ def main():
 
     images_to_process = all_image_files
     videos_to_process = all_video_files
-
     total_new_files = len(images_to_process) + len(videos_to_process)
     print(
         f"Found {len(images_to_process)} new images and {len(videos_to_process)} new videos to process.")
@@ -345,6 +349,8 @@ def main():
             if csvfile.tell() == 0:
                 writer.writeheader()
 
+            image_results = {}  # To store image results for video mapping
+
             if images_to_process:
                 print(
                     f"Processing {len(images_to_process)} images using {args.image_workers} parallel loader(s)...")
@@ -360,8 +366,6 @@ def main():
                     collate_fn=safe_collate,
                     pin_memory=True if device.type == 'cuda' else False
                 )
-
-                # Increased batch_size based on user's screenshot
                 pbar = tqdm(image_loader, desc="Processing Images",
                             total=len(image_loader))
                 for tensor_batch, path_batch in pbar:
@@ -378,20 +382,69 @@ def main():
                             {"File Path": path, "Prediction": pred,
                                 "NSFW Probability": f"{prob:.4f}"}
                         )
+                        # Store result for video mapping
+                        image_results[path] = prob
                     csvfile.flush()
                     files_processed_this_session += len(path_batch)
 
             if videos_to_process:
-                use_parallel = args.workers != 0
-                if use_parallel:
-                    num_workers = args.workers or os.cpu_count()
-                    print(
-                        f"Processing {len(videos_to_process)} videos in parallel with {num_workers} workers...")
-                    with ProcessPoolExecutor(max_workers=num_workers) as executor:
-                        futures = {executor.submit(
-                            analyze_video_worker, path, args.model_name): path for path in videos_to_process}
-                        for future in tqdm(as_completed(futures), total=len(videos_to_process), desc="Processing Videos"):
-                            res = future.result()
+                videos_for_full_analysis = []
+                print(
+                    "Checking for videos associated with processed images (e.g., Live Photos)...")
+                for video_path_str in videos_to_process:
+                    video_path = Path(video_path_str)
+                    mapped_prob = None
+
+                    # Check for a corresponding HEIC or AVIF file that has been processed
+                    heic_path_str = str(video_path.with_suffix('.heic'))
+                    avif_path_str = str(video_path.with_suffix('.avif'))
+
+                    # Prefer HEIC result if both exist, as it's the primary Live Photo format
+                    if heic_path_str in image_results:
+                        mapped_prob = image_results[heic_path_str]
+                    elif avif_path_str in image_results:
+                        mapped_prob = image_results[avif_path_str]
+
+                    if mapped_prob is not None:
+                        # Found a corresponding image result. Use it and skip video analysis.
+                        pred = "NSFW" if mapped_prob >= args.threshold else "SFW"
+                        if pred == "NSFW":
+                            nsfw_found_this_session += 1
+                        writer.writerow({
+                            "File Path": video_path_str,
+                            "Prediction": pred,
+                            "NSFW Probability": f"{mapped_prob:.4f}"
+                        })
+                        csvfile.flush()
+                        files_processed_this_session += 1
+                    else:
+                        # No corresponding image was processed, so this video needs full analysis.
+                        videos_for_full_analysis.append(video_path_str)
+
+                if videos_for_full_analysis:
+                    use_parallel = args.workers != 0
+                    if use_parallel:
+                        num_workers = args.workers or os.cpu_count()
+                        print(
+                            f"Processing {len(videos_for_full_analysis)} videos in parallel with {num_workers} workers...")
+                        with ProcessPoolExecutor(max_workers=num_workers) as executor:
+                            futures = {executor.submit(
+                                analyze_video_worker, path, args.model_name): path for path in videos_for_full_analysis}
+                            for future in tqdm(as_completed(futures), total=len(videos_for_full_analysis), desc="Processing Videos"):
+                                res = future.result()
+                                prob = res['prob']
+                                pred = "ERROR" if prob < 0 else "NSFW" if prob >= args.threshold else "SFW"
+                                if pred == "NSFW":
+                                    nsfw_found_this_session += 1
+                                writer.writerow(
+                                    {"File Path": res['path'], "Prediction": pred, "NSFW Probability": f"{prob:.4f}" if prob >= 0 else "N/A"})
+                                csvfile.flush()
+                                files_processed_this_session += 1
+                    else:
+                        print(
+                            f"Processing {len(videos_for_full_analysis)} videos serially on {device.type}...")
+                        for path in tqdm(videos_for_full_analysis, desc="Processing Videos"):
+                            res = _perform_video_analysis(path, detector)
                             prob = res['prob']
                             pred = "ERROR" if prob < 0 else "NSFW" if prob >= args.threshold else "SFW"
                             if pred == "NSFW":
@@ -400,19 +453,7 @@ def main():
                                 {"File Path": res['path'], "Prediction": pred, "NSFW Probability": f"{prob:.4f}" if prob >= 0 else "N/A"})
                             csvfile.flush()
                             files_processed_this_session += 1
-                else:
-                    print(
-                        f"Processing {len(videos_to_process)} videos serially on {device.type}...")
-                    for path in tqdm(videos_to_process, desc="Processing Videos"):
-                        res = _perform_video_analysis(path, detector)
-                        prob = res['prob']
-                        pred = "ERROR" if prob < 0 else "NSFW" if prob >= args.threshold else "SFW"
-                        if pred == "NSFW":
-                            nsfw_found_this_session += 1
-                        writer.writerow(
-                            {"File Path": res['path'], "Prediction": pred, "NSFW Probability": f"{prob:.4f}" if prob >= 0 else "N/A"})
-                        csvfile.flush()
-                        files_processed_this_session += 1
+
     except KeyboardInterrupt:
         print("\nProcess interrupted by user. Progress has been saved. Run the script again to resume.")
     finally:
