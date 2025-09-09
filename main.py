@@ -13,7 +13,6 @@ import cv2
 from tqdm import tqdm
 import numpy as np
 from concurrent.futures import ProcessPoolExecutor, as_completed
-
 # --- Dependency for the alternative model ---
 try:
     from transformers import AutoModelForImageClassification, ViTImageProcessor
@@ -22,7 +21,6 @@ except ImportError:
     print("Install it with: pip install transformers")
     AutoModelForImageClassification = None
     ViTImageProcessor = None
-
 # --- HEIC/AVIF Support (Optional Dependencies) ---
 try:
     import pillow_heif
@@ -35,7 +33,6 @@ try:
 except ImportError:
     print("Warning: `pillow-heif` not found. HEIC/HEIF files may not be processed.")
     print("To process them, run: pip install pillow-heif")
-
 try:
     import pillow_avif
     if hasattr(pillow_avif, 'register_avif_opener'):
@@ -43,52 +40,41 @@ try:
         print("AVIF support enabled.")
 except ImportError:
     print("Warning: `pillow-avif` not found. AVIF files may not be processed.")
-
 # --- Constants ---
 SUPPORTED_IMAGE_EXTENSIONS = [".jpg", ".jpeg",
                               ".png", ".bmp", ".webp", ".heic", ".heif", ".avif"]
 SUPPORTED_VIDEO_EXTENSIONS = [".mp4", ".avi", ".mov", ".mkv", ".webm"]
 MIN_VIDEO_SAMPLES = 2
 MAX_VIDEO_SAMPLES = 10
-
 # --- NEW: Picklable Transform Class for Hugging Face Processor ---
-
 
 class HfProcessorTransform:
     """
     A picklable transform class for Hugging Face processors.
     This replaces the unpicklable lambda function.
     """
-
     def __init__(self, processor):
         self.processor = processor
-
     def __call__(self, img):
         # The logic from the original lambda function is now here
         return self.processor(images=img, return_tensors="pt")['pixel_values'].squeeze(0)
-
 # --- Model Abstraction ---
-
 
 class NsfwDetector(abc.ABC):
     """Abstract base class for NSFW detectors."""
-
     def __init__(self, device: torch.device):
         self.device = device
         self.model = None
-
     @abc.abstractmethod
     def get_transforms(self):
         """Returns the appropriate transformation function for the model."""
         pass
-
     @abc.abstractmethod
     def predict_tensor_batch(self, tensor_batch: torch.Tensor) -> np.ndarray:
         """
         Analyzes a batch of tensors and returns NSFW probabilities.
         """
         pass
-
     def predict(self, image_batch: list[Image.Image]) -> np.ndarray:
         """
         Analyzes a batch of PIL images. Convenience wrapper for single images.
@@ -101,10 +87,8 @@ class NsfwDetector(abc.ABC):
                               for img in image_batch]).to(self.device)
         return self.predict_tensor_batch(tensors)
 
-
 class TimmMarqoDetector(NsfwDetector):
     """Detector for the Marqo/nsfw-image-detection-384 model using timm."""
-
     def __init__(self, device: torch.device):
         super().__init__(device)
         model_id = "hf_hub:Marqo/nsfw-image-detection-384"
@@ -116,10 +100,8 @@ class TimmMarqoDetector(NsfwDetector):
             **data_config, is_training=False)
         self.nsfw_idx = self.model.pretrained_cfg["label_names"].index("NSFW")
         print("Marqo model loaded successfully.")
-
     def get_transforms(self):
         return self.transforms
-
     def predict_tensor_batch(self, tensor_batch: torch.Tensor) -> np.ndarray:
         if tensor_batch.ndim == 3:
             tensor_batch = tensor_batch.unsqueeze(0)
@@ -127,10 +109,8 @@ class TimmMarqoDetector(NsfwDetector):
             output = self.model(tensor_batch).softmax(dim=-1)
         return output[:, self.nsfw_idx].cpu().numpy()
 
-
 class HfFalconsaiDetector(NsfwDetector):
     """Detector for the Falconsai/nsfw_image_detection model using transformers."""
-
     def __init__(self, device: torch.device):
         super().__init__(device)
         if ViTImageProcessor is None:
@@ -143,11 +123,9 @@ class HfFalconsaiDetector(NsfwDetector):
             model_id).to(self.device).eval()
         self.nsfw_idx = int(self.model.config.label2id["nsfw"])
         print(f"{model_id} model loaded successfully.")
-
     def get_transforms(self):
         # --- FIX: Return an instance of our new picklable class ---
         return HfProcessorTransform(self.processor)
-
     def predict(self, image_batch: list[Image.Image]) -> np.ndarray:
         # Override for direct processor use, which is more efficient for this model
         if not image_batch:
@@ -157,7 +135,6 @@ class HfFalconsaiDetector(NsfwDetector):
             inputs = {k: v.to(self.device) for k, v in inputs.items()}
             logits = self.model(**inputs).logits
         return logits.softmax(dim=-1)[:, self.nsfw_idx].cpu().numpy()
-
     def predict_tensor_batch(self, tensor_batch: torch.Tensor) -> np.ndarray:
         if tensor_batch.ndim == 3:
             tensor_batch = tensor_batch.unsqueeze(0)
@@ -165,27 +142,21 @@ class HfFalconsaiDetector(NsfwDetector):
             logits = self.model(pixel_values=tensor_batch).logits
         return logits.softmax(dim=-1)[:, self.nsfw_idx].cpu().numpy()
 
-
 DETECTOR_MAPPING = {
     "marqo": TimmMarqoDetector,
     "falconsai": HfFalconsaiDetector,
 }
-
 # --- PyTorch Dataset for efficient, parallel image loading ---
-
 
 class ImageFileDataset(Dataset):
     """
     A PyTorch Dataset to load images from a list of file paths.
     """
-
     def __init__(self, file_paths: list[str], transform=None):
         self.file_paths = file_paths
         self.transform = transform
-
     def __len__(self):
         return len(self.file_paths)
-
     def __getitem__(self, idx):
         path = self.file_paths[idx]
         try:
@@ -196,7 +167,6 @@ class ImageFileDataset(Dataset):
         except Exception:
             # If an image is corrupt, return None. Filtered by safe_collate.
             return None, path
-
 
 def safe_collate(batch):
     """
@@ -209,10 +179,8 @@ def safe_collate(batch):
     images = torch.stack(images, 0)
     return images, list(paths)
 
-
 # --- Global variable for worker processes ---
 worker_detector = None
-
 
 def _perform_video_analysis(video_path: str, detector: NsfwDetector) -> dict:
     max_nsfw_prob = 0.0
@@ -222,21 +190,17 @@ def _perform_video_analysis(video_path: str, detector: NsfwDetector) -> dict:
         if not cap.isOpened():
             print(f"Error: Could not open video file {video_path}")
             return {"path": video_path, "prob": -1.0}
-
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
         if total_frames < 1:
             return {"path": video_path, "prob": 0.0}
-
         num_samples = min(MAX_VIDEO_SAMPLES, max(
             MIN_VIDEO_SAMPLES, total_frames))
         start_frame = int(total_frames * 0.05)
         end_frame = int(total_frames * 0.95)
         if start_frame >= end_frame:
             start_frame, end_frame = 0, max(0, total_frames - 1)
-
         sample_indices = np.unique(np.linspace(
             start_frame, end_frame, num=num_samples, dtype=int))
-
         for frame_index in sample_indices:
             cap.set(cv2.CAP_PROP_POS_FRAMES, frame_index)
             ret, frame = cap.read()
@@ -254,7 +218,6 @@ def _perform_video_analysis(video_path: str, detector: NsfwDetector) -> dict:
             cap.release()
     return {"path": video_path, "prob": max_nsfw_prob}
 
-
 def analyze_video_worker(video_path: str, model_name: str) -> dict:
     global worker_detector
     if worker_detector is None:
@@ -264,7 +227,6 @@ def analyze_video_worker(video_path: str, model_name: str) -> dict:
             f"Initializing detector '{model_name}' in worker {os.getpid()}...")
         worker_detector = detector_class(device)
     return _perform_video_analysis(video_path, worker_detector)
-
 
 def main():
     parser = argparse.ArgumentParser(
@@ -287,35 +249,45 @@ def main():
     parser.add_argument("--no-cuda", action="store_true",
                         help="Disable CUDA and force CPU usage.")
     args = parser.parse_args()
-
     start_time = time.time()
     device = torch.device("cuda" if torch.cuda.is_available()
                           and not args.no_cuda else "cpu")
     print(f"Using device: {device}")
-
     try:
         detector_class = DETECTOR_MAPPING[args.model_name]
         detector = detector_class(device)
     except (ImportError, ValueError, KeyError) as e:
         print(f"Error initializing model '{args.model_name}': {e}")
         return
-
+    
     processed_files = set()
+    # --- CHANGE 1: Initialize a dictionary to store existing results from the CSV ---
+    existing_results = {}
+    
     if os.path.exists(args.output_file):
         print(f"Resuming from existing output file: {args.output_file}")
         try:
             with open(args.output_file, 'r', newline='', encoding='utf-8') as f:
-                reader = csv.reader(f)
-                header = next(reader)
+                # --- CHANGE 2: Use DictReader to easily access columns by name ---
+                reader = csv.DictReader(f)
                 for row in reader:
-                    if row:
-                        processed_files.add(row[0])
+                    path = row.get("File Path")
+                    prob_str = row.get("NSFW Probability")
+                    if path:
+                        processed_files.add(path)
+                        # Store the probability for Live Photo mapping later
+                        if prob_str and prob_str != "N/A":
+                            try:
+                                existing_results[path] = float(prob_str)
+                            except ValueError:
+                                pass # Ignore if probability isn't a valid float
             print(
                 f"Found {len(processed_files)} already processed files. They will be skipped.")
         except Exception as e:
             print(
                 f"Warning: Could not read existing output file. Starting from scratch. Error: {e}")
             processed_files.clear()
+            existing_results.clear()
 
     print(f"Scanning for media files in '{args.input_folder}'...")
     all_image_files, all_video_files = [], []
@@ -329,7 +301,6 @@ def main():
                 all_image_files.append(full_path)
             elif ext in SUPPORTED_VIDEO_EXTENSIONS:
                 all_video_files.append(full_path)
-
     images_to_process = all_image_files
     videos_to_process = all_video_files
     total_new_files = len(images_to_process) + len(videos_to_process)
@@ -338,7 +309,6 @@ def main():
     if total_new_files == 0:
         print("No new files to process. Exiting.")
         return
-
     files_processed_this_session = 0
     nsfw_found_this_session = 0
     fieldnames = ["File Path", "Prediction", "NSFW Probability"]
@@ -348,9 +318,10 @@ def main():
             csvfile.seek(0, 2)
             if csvfile.tell() == 0:
                 writer.writeheader()
-
-            image_results = {}  # To store image results for video mapping
-
+            
+            # This dictionary will store results from the *current* session
+            image_results_this_session = {}
+            
             if images_to_process:
                 print(
                     f"Processing {len(images_to_process)} images using {args.image_workers} parallel loader(s)...")
@@ -383,28 +354,39 @@ def main():
                                 "NSFW Probability": f"{prob:.4f}"}
                         )
                         # Store result for video mapping
-                        image_results[path] = prob
+                        image_results_this_session[path] = prob
                     csvfile.flush()
                     files_processed_this_session += len(path_batch)
 
             if videos_to_process:
+                # --- CHANGE 3: Combine existing results with results from this session ---
+                # This ensures we can map Live Photos even if the image part was processed in a prior run.
+                # Results from this session will overwrite old ones if a file is re-processed.
+                all_known_image_results = {**existing_results, **image_results_this_session}
+
                 videos_for_full_analysis = []
                 print(
                     "Checking for videos associated with processed images (e.g., Live Photos)...")
+                
+                live_photo_mapped = 0
                 for video_path_str in videos_to_process:
                     video_path = Path(video_path_str)
+                    video_stem = video_path.with_suffix('') # e.g., /path/to/IMG_1234
                     mapped_prob = None
 
-                    # Check for a corresponding HEIC or AVIF file that has been processed
-                    heic_path_str = str(video_path.with_suffix('.heic'))
-                    avif_path_str = str(video_path.with_suffix('.avif'))
-
-                    # Prefer HEIC result if both exist, as it's the primary Live Photo format
-                    if heic_path_str in image_results:
-                        mapped_prob = image_results[heic_path_str]
-                    elif avif_path_str in image_results:
-                        mapped_prob = image_results[avif_path_str]
-
+                    # --- FIX: Iteratively check for all possible image extensions, case-insensitively ---
+                    # Create a list of potential extensions to check for Live Photos or similar formats
+                    # Common ones are HEIC/AVIF/JPG/JPEG. We can check all supported image extensions.
+                    for img_ext in SUPPORTED_IMAGE_EXTENSIONS:
+                        # Check both lowercase and uppercase versions of the extension
+                        for ext_casing in [img_ext.lower(), img_ext.upper()]:
+                            potential_image_path = str(video_stem) + ext_casing
+                            if potential_image_path in all_known_image_results:
+                                mapped_prob = all_known_image_results[potential_image_path]
+                                break # Found a match, stop checking other extensions
+                        if mapped_prob is not None:
+                            break # Found a match, exit the outer loop as well
+                        
                     if mapped_prob is not None:
                         # Found a corresponding image result. Use it and skip video analysis.
                         pred = "NSFW" if mapped_prob >= args.threshold else "SFW"
@@ -417,9 +399,15 @@ def main():
                         })
                         csvfile.flush()
                         files_processed_this_session += 1
+
+                        live_photo_mapped += 1
                     else:
                         # No corresponding image was processed, so this video needs full analysis.
                         videos_for_full_analysis.append(video_path_str)
+
+                print(
+                    f"Mapped {live_photo_mapped} videos to existing image results. {len(videos_for_full_analysis)} videos require full analysis."
+                )
 
                 if videos_for_full_analysis:
                     use_parallel = args.workers != 0
@@ -453,7 +441,6 @@ def main():
                                 {"File Path": res['path'], "Prediction": pred, "NSFW Probability": f"{prob:.4f}" if prob >= 0 else "N/A"})
                             csvfile.flush()
                             files_processed_this_session += 1
-
     except KeyboardInterrupt:
         print("\nProcess interrupted by user. Progress has been saved. Run the script again to resume.")
     finally:
@@ -470,7 +457,6 @@ def main():
                             total_nsfw_count += 1
             except Exception as e:
                 print(f"\nCould not read final stats from output file: {e}")
-
         print("\n--- Detection Complete ---")
         print(
             f"Processed {files_processed_this_session} new files this session.")
@@ -479,7 +465,6 @@ def main():
             f"Total NSFW files found in output: {total_nsfw_count} (threshold >= {args.threshold})")
         print(
             f"Processing time for this session: {end_time - start_time:.2f} seconds")
-
 
 if __name__ == "__main__":
     torch.multiprocessing.set_start_method('spawn', force=True)
