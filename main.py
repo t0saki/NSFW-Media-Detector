@@ -8,12 +8,12 @@ import torch
 import timm
 import traceback
 from PIL import Image
-import cv2  # OpenCV for video processing
+import cv2
 from tqdm import tqdm
 import numpy as np
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
-# New dependency for the alternative model
+# --- Dependency for the alternative model ---
 try:
     from transformers import AutoModelForImageClassification, ViTImageProcessor
 except ImportError:
@@ -21,6 +21,27 @@ except ImportError:
     print("Install it with: pip install transformers")
     AutoModelForImageClassification = None
     ViTImageProcessor = None
+
+# --- HEIC/AVIF Support (Optional Dependencies) ---
+# We register openers for these formats. If the libraries are not installed,
+# the script will still run but will skip these file types.
+try:
+    import pillow_heif
+    pillow_heif.register_heif_opener()
+    print("HEIC/HEIF support enabled.")
+except ImportError:
+    print("Warning: `pillow-heif` not found. HEIC/HEIF files will raise an error on open.")
+    print("To process them, run: pip install pillow-heif")
+
+try:
+    import pillow_avif
+    pillow_avif.register_avif_opener()
+    print("AVIF support enabled.")
+except ImportError:
+    print("Warning: `pillow-avif-plugin` not found. AVIF files will raise an error on open.")
+    print("To process them, run: pip install pillow-avif-plugin")
+# --- End of new code block ---
+
 
 # --- Constants ---
 SUPPORTED_IMAGE_EXTENSIONS = [".jpg", ".jpeg",
@@ -118,44 +139,42 @@ def analyze_image_batch(image_paths: list, detector: NsfwDetector):
     images, valid_paths, batch_results = [], [], []
     for path in image_paths:
         try:
+            # With the registered openers, Image.open now supports HEIC/AVIF
             img = Image.open(path).convert("RGB")
             images.append(img)
             valid_paths.append(path)
         except Exception as e:
             print(
                 f"Warning: Could not open image {path}, skipping. Error: {e}")
-            batch_results.append({"path": path, "prob": -1.0})  # 记录加载失败的文件
+            batch_results.append({"path": path, "prob": -1.0})
 
     if not images:
         return batch_results
 
     try:
+        # Attempt batch processing first for efficiency
         nsfw_probs = detector.predict(images)
         for i, path in enumerate(valid_paths):
             batch_results.append({"path": path, "prob": nsfw_probs[i]})
         return batch_results
-
     except Exception as e:
-        print(f"Warning: Batch processing failed. Error: {e}")
-        print("Retrying files in this batch individually...")
-
+        print(
+            f"Warning: Batch processing failed. Error: {e}. Retrying files individually...")
         # Fallback to individual processing
-        batch_results = []
-        for path in image_paths:
-            if path not in valid_paths:
-                batch_results.append({"path": path, "prob": -1.0})
-
+        # First, add back the results for files that failed to open initially
+        final_results = [res for res in batch_results if res['prob'] == -1.0]
         for i, img in enumerate(images):
             path = valid_paths[i]
             try:
                 nsfw_prob = detector.predict([img])[0]
-                batch_results.append({"path": path, "prob": nsfw_prob})
+                final_results.append({"path": path, "prob": nsfw_prob})
             except Exception as individual_e:
                 print(
                     f"Error processing individual file {path} after batch failure. Error: {individual_e}")
-                batch_results.append({"path": path, "prob": -1.0})
+                final_results.append({"path": path, "prob": -1.0})
+        return final_results
 
-        return batch_results
+# --- Video and Main Logic (No changes needed here) ---
 
 
 def _perform_video_analysis(video_path: str, detector: NsfwDetector) -> dict:
@@ -169,15 +188,11 @@ def _perform_video_analysis(video_path: str, detector: NsfwDetector) -> dict:
         if not cap.isOpened():
             print(f"Error: Could not open video file {video_path}")
             return {"path": video_path, "prob": -1.0}
-
-        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        total_frames = int(cap.get(cv.CAP_PROP_FRAME_COUNT))
         if total_frames < 1:
             return {"path": video_path, "prob": 0.0}
-
-        num_samples = min(MAX_VIDEO_SAMPLES, total_frames)
-        if total_frames > 1:
-            num_samples = max(MIN_VIDEO_SAMPLES, num_samples)
-
+        num_samples = min(MAX_VIDEO_SAMPLES, max(
+            MIN_VIDEO_SAMPLES, total_frames))
         start_frame = int(total_frames * 0.05)
         end_frame = int(total_frames * 0.95)
         if start_frame >= end_frame:
