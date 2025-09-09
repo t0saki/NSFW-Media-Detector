@@ -4,7 +4,6 @@ import csv
 from pathlib import Path
 import time
 import abc
-
 import torch
 import timm
 import traceback
@@ -22,7 +21,6 @@ except ImportError:
     print("Install it with: pip install transformers")
     AutoModelForImageClassification = None
     ViTImageProcessor = None
-
 
 # --- Constants ---
 SUPPORTED_IMAGE_EXTENSIONS = [".jpg", ".jpeg",
@@ -60,29 +58,22 @@ class TimmMarqoDetector(NsfwDetector):
         super().__init__(device)
         model_id = "hf_hub:Marqo/nsfw-image-detection-384"
         print(f"Loading {model_id} model (timm)...")
-        self.model = timm.create_model(model_id, pretrained=True)
-        self.model = self.model.to(self.device)
-        self.model = self.model.eval()
-
+        self.model = timm.create_model(
+            model_id, pretrained=True).to(self.device).eval()
         data_config = timm.data.resolve_model_data_config(self.model)
         self.transforms = timm.data.create_transform(
             **data_config, is_training=False)
-
-        class_names = self.model.pretrained_cfg["label_names"]
-        self.nsfw_idx = class_names.index("NSFW")
+        self.nsfw_idx = self.model.pretrained_cfg["label_names"].index("NSFW")
         print("Marqo model loaded successfully.")
 
     def predict(self, image_batch: list[Image.Image]) -> np.ndarray:
         if not image_batch:
             return np.array([])
-
         tensors = torch.stack([self.transforms(img)
                               for img in image_batch]).to(self.device)
         with torch.no_grad():
             output = self.model(tensors).softmax(dim=-1)
-
-        nsfw_probs = output[:, self.nsfw_idx].cpu().numpy()
-        return nsfw_probs
+        return output[:, self.nsfw_idx].cpu().numpy()
 
 
 class HfFalconsaiDetector(NsfwDetector):
@@ -95,34 +86,22 @@ class HfFalconsaiDetector(NsfwDetector):
                 "`transformers` library is required for the 'falconsai' model.")
         model_id = "Falconsai/nsfw_image_detection"
         print(f"Loading {model_id} model (transformers)...")
-
         self.processor = ViTImageProcessor.from_pretrained(model_id)
-        self.model = AutoModelForImageClassification.from_pretrained(model_id)
-        self.model = self.model.to(self.device)
-        self.model = self.model.eval()
-
-        self.nsfw_idx = int(self.model.config.label2id.get("nsfw"))
-        if self.nsfw_idx is None:
-            raise ValueError(
-                f"Could not find 'nsfw' label in model config for {model_id}")
-
+        self.model = AutoModelForImageClassification.from_pretrained(
+            model_id).to(self.device).eval()
+        self.nsfw_idx = int(self.model.config.label2id["nsfw"])
         print(f"{model_id} model loaded successfully.")
 
     def predict(self, image_batch: list[Image.Image]) -> np.ndarray:
         if not image_batch:
             return np.array([])
-
         with torch.no_grad():
             inputs = self.processor(images=image_batch, return_tensors="pt")
             inputs = {k: v.to(self.device) for k, v in inputs.items()}
             outputs = self.model(**inputs)
-
-        probabilities = outputs.logits.softmax(dim=-1)
-        nsfw_probs = probabilities[:, self.nsfw_idx].cpu().numpy()
-        return nsfw_probs
+        return outputs.logits.softmax(dim=-1)[:, self.nsfw_idx].cpu().numpy()
 
 
-# --- Model Mapping ---
 DETECTOR_MAPPING = {
     "marqo": TimmMarqoDetector,
     "falconsai": HfFalconsaiDetector,
@@ -146,18 +125,14 @@ def analyze_image_batch(image_paths: list, detector: NsfwDetector):
                 print(
                     f"Warning: Could not open image {path}, skipping. Error: {e}")
                 batch_results.append({"path": path, "prob": -1.0})
-
         if not images:
             return batch_results
 
         nsfw_probs = detector.predict(images)
-
         for i, path in enumerate(valid_paths):
             batch_results.append({"path": path, "prob": nsfw_probs[i]})
-
     except Exception as e:
-        print(f"Error processing image batch: {e}")
-        print(traceback.format_exc())
+        print(f"Error processing image batch: {e}\n{traceback.format_exc()}")
         for path in image_paths:
             if not any(r['path'] == path for r in batch_results):
                 batch_results.append({"path": path, "prob": -1.0})
@@ -180,13 +155,14 @@ def _perform_video_analysis(video_path: str, detector: NsfwDetector) -> dict:
         if total_frames < 1:
             return {"path": video_path, "prob": 0.0}
 
-        num_samples = min(MAX_VIDEO_SAMPLES, max(
-            MIN_VIDEO_SAMPLES, total_frames))
+        num_samples = min(MAX_VIDEO_SAMPLES, total_frames)
+        if total_frames > 1:
+            num_samples = max(MIN_VIDEO_SAMPLES, num_samples)
 
         start_frame = int(total_frames * 0.05)
         end_frame = int(total_frames * 0.95)
         if start_frame >= end_frame:
-            start_frame, end_frame = 0, total_frames - 1 if total_frames > 0 else 0
+            start_frame, end_frame = 0, max(0, total_frames - 1)
 
         sample_indices = np.unique(np.linspace(
             start_frame, end_frame, num=num_samples, dtype=int))
@@ -198,45 +174,38 @@ def _perform_video_analysis(video_path: str, detector: NsfwDetector) -> dict:
                 continue
 
             img = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-
-            # Predict on a batch of one
             current_nsfw_prob = detector.predict([img])[0]
-
             if current_nsfw_prob > max_nsfw_prob:
                 max_nsfw_prob = current_nsfw_prob
-
     except Exception as e:
         print(f"Error processing video {video_path}: {e}")
         return {"path": video_path, "prob": -1.0}
     finally:
         if cap:
             cap.release()
-
     return {"path": video_path, "prob": max_nsfw_prob}
 
 
 def analyze_video_worker(video_path: str, model_name: str) -> dict:
     """Worker function for parallel video analysis (uses CPU)."""
     global worker_detector
-    if worker_detector is None:  # Lazy initialization for each worker process
+    if worker_detector is None:
         device = torch.device("cpu")
         detector_class = DETECTOR_MAPPING[model_name]
         print(
-            f"Initializing detector '{model_name}' in worker process {os.getpid()}...")
+            f"Initializing detector '{model_name}' in worker {os.getpid()}...")
         worker_detector = detector_class(device)
-
     return _perform_video_analysis(video_path, worker_detector)
 
 
 def yield_batches(items, batch_size):
-    """Yield successive n-sized chunks from a list."""
     for i in range(0, len(items), batch_size):
         yield items[i:i + batch_size]
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="High-Performance NSFW Image/Video Detection. Samples frames from videos."
+        description="High-Performance NSFW Image/Video Detection with resume capability."
     )
     parser.add_argument("input_folder", type=str,
                         help="Path to the folder to scan recursively.")
@@ -249,12 +218,11 @@ def main():
     parser.add_argument("--batch-size", type=int, default=64,
                         help="Number of images to process in a single batch (for GPU).")
     parser.add_argument("--workers", type=int, default=None,
-                        help="Number of CPU cores for video processing. Defaults to all available. Set to 0 to disable parallel processing.")
+                        help="Number of CPU cores for video processing. Set to 0 to disable parallelism.")
     parser.add_argument("--no-cuda", action="store_true",
                         help="Disable CUDA and force CPU usage.")
 
     args = parser.parse_args()
-
     start_time = time.time()
     device = torch.device("cuda" if torch.cuda.is_available()
                           and not args.no_cuda else "cpu")
@@ -268,79 +236,135 @@ def main():
         print(f"Error initializing model '{args.model_name}': {e}")
         return
 
+    # --- Resume Logic ---
+    processed_files = set()
+    if os.path.exists(args.output_file):
+        print(f"Resuming from existing output file: {args.output_file}")
+        try:
+            with open(args.output_file, 'r', newline='', encoding='utf-8') as f:
+                reader = csv.reader(f)
+                header = next(reader)  # Skip header
+                for row in reader:
+                    if row:
+                        processed_files.add(row[0])
+            print(
+                f"Found {len(processed_files)} already processed files. They will be skipped.")
+        except Exception as e:
+            print(
+                f"Warning: Could not read existing output file. Starting from scratch. Error: {e}")
+            processed_files.clear()
+
     # --- File Discovery ---
     print(f"Scanning for media files in '{args.input_folder}'...")
-    image_files, video_files = [], []
+    all_image_files, all_video_files = [], []
     for root, _, files in os.walk(args.input_folder):
         for file in files:
             ext = Path(file).suffix.lower()
+            full_path = os.path.join(root, file)
             if ext in SUPPORTED_IMAGE_EXTENSIONS:
-                image_files.append(os.path.join(root, file))
+                all_image_files.append(full_path)
             elif ext in SUPPORTED_VIDEO_EXTENSIONS:
-                video_files.append(os.path.join(root, file))
+                all_video_files.append(full_path)
 
-    total_files = len(image_files) + len(video_files)
+    # Filter out already processed files
+    images_to_process = [
+        f for f in all_image_files if f not in processed_files]
+    videos_to_process = [
+        f for f in all_video_files if f not in processed_files]
+
+    total_new_files = len(images_to_process) + len(videos_to_process)
     print(
-        f"Found {len(image_files)} images and {len(video_files)} videos ({total_files} total).")
+        f"Found {len(all_image_files)} total images and {len(all_video_files)} total videos.")
+    print(f"Processing {total_new_files} new files this session.")
 
-    results = []
+    if total_new_files == 0:
+        print("No new files to process. Exiting.")
+        return
 
-    # --- Process Images in Batches ---
-    if image_files:
-        print(
-            f"Processing {len(image_files)} images with batch size {args.batch_size}...")
-        image_pbar = tqdm(total=len(image_files), desc="Processing Images")
-        for batch_paths in yield_batches(image_files, args.batch_size):
-            batch_results = analyze_image_batch(batch_paths, detector)
-            results.extend(batch_results)
-            image_pbar.update(len(batch_paths))
-        image_pbar.close()
+    # --- Open output file for appending and process files ---
+    files_processed_this_session = 0
+    nsfw_found_this_session = 0
+    fieldnames = ["File Path", "Prediction", "NSFW Probability"]
 
-    # --- Process Videos ---
-    if video_files:
-        # Use parallel processing if on CPU and workers are not disabled
-        use_parallel = device.type == 'cpu' and args.workers != 0
+    try:
+        with open(args.output_file, 'a', newline='', encoding='utf-8') as csvfile:
+            writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+            # Write header only if the file is new/empty
+            csvfile.seek(0, 2)  # Go to the end of the file
+            if csvfile.tell() == 0:
+                writer.writeheader()
 
-        if use_parallel:
-            num_workers = args.workers or os.cpu_count()
-            print(
-                f"Processing {len(video_files)} videos in parallel with {num_workers} workers...")
-            with ProcessPoolExecutor(max_workers=num_workers) as executor:
-                futures = [executor.submit(
-                    analyze_video_worker, path, args.model_name) for path in video_files]
-                for future in tqdm(as_completed(futures), total=len(video_files), desc="Processing Videos"):
-                    results.append(future.result())
-        else:
-            print(
-                f"Processing {len(video_files)} videos serially on {device.type}...")
-            for path in tqdm(video_files, desc="Processing Videos"):
-                results.append(_perform_video_analysis(path, detector))
+            # --- Process Images ---
+            if images_to_process:
+                pbar = tqdm(total=len(images_to_process),
+                            desc="Processing Images")
+                for batch_paths in yield_batches(images_to_process, args.batch_size):
+                    batch_results = analyze_image_batch(batch_paths, detector)
+                    for res in batch_results:
+                        prob = res['prob']
+                        pred = "ERROR" if prob < 0 else "NSFW" if prob >= args.threshold else "SFW"
+                        if pred == "NSFW":
+                            nsfw_found_this_session += 1
+                        writer.writerow(
+                            {"File Path": res['path'], "Prediction": pred, "NSFW Probability": f"{prob:.4f}" if prob >= 0 else "N/A"})
+                    csvfile.flush()  # Ensure data is written to disk
+                    pbar.update(len(batch_paths))
+                    files_processed_this_session += len(batch_paths)
+                pbar.close()
 
-    # --- Output Results ---
-    print(f"Writing {len(results)} results to '{args.output_file}'...")
-    with open(args.output_file, 'w', newline='', encoding='utf-8') as csvfile:
-        fieldnames = ["File Path", "Prediction", "NSFW Probability"]
-        writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
-        writer.writeheader()
-        nsfw_count = 0
-        for res in sorted(results, key=lambda x: x['path']):
-            nsfw_prob = res['prob']
-            if nsfw_prob < 0:
-                prediction, prob_str = "ERROR", "N/A"
-            else:
-                prediction = "NSFW" if nsfw_prob >= args.threshold else "SFW"
-                prob_str = f"{nsfw_prob:.4f}"
-                if prediction == "NSFW":
-                    nsfw_count += 1
-            writer.writerow(
-                {"File Path": res['path'], "Prediction": prediction, "NSFW Probability": prob_str})
+            # --- Process Videos ---
+            if videos_to_process:
+                use_parallel = device.type == 'cpu' and args.workers != 0
+                if use_parallel:
+                    num_workers = args.workers or os.cpu_count()
+                    print(
+                        f"Processing {len(videos_to_process)} videos in parallel with {num_workers} workers...")
+                    with ProcessPoolExecutor(max_workers=num_workers) as executor:
+                        futures = {executor.submit(
+                            analyze_video_worker, path, args.model_name): path for path in videos_to_process}
+                        for future in tqdm(as_completed(futures), total=len(videos_to_process), desc="Processing Videos"):
+                            res = future.result()
+                            prob = res['prob']
+                            pred = "ERROR" if prob < 0 else "NSFW" if prob >= args.threshold else "SFW"
+                            if pred == "NSFW":
+                                nsfw_found_this_session += 1
+                            writer.writerow(
+                                {"File Path": res['path'], "Prediction": pred, "NSFW Probability": f"{prob:.4f}" if prob >= 0 else "N/A"})
+                            csvfile.flush()
+                            files_processed_this_session += 1
+                else:
+                    print(
+                        f"Processing {len(videos_to_process)} videos serially on {device.type}...")
+                    for path in tqdm(videos_to_process, desc="Processing Videos"):
+                        res = _perform_video_analysis(path, detector)
+                        prob = res['prob']
+                        pred = "ERROR" if prob < 0 else "NSFW" if prob >= args.threshold else "SFW"
+                        if pred == "NSFW":
+                            nsfw_found_this_session += 1
+                        writer.writerow(
+                            {"File Path": res['path'], "Prediction": pred, "NSFW Probability": f"{prob:.4f}" if prob >= 0 else "N/A"})
+                        csvfile.flush()
+                        files_processed_this_session += 1
+    except KeyboardInterrupt:
+        print("\nProcess interrupted by user. Progress has been saved. Run the script again to resume.")
 
+    # --- Final Summary ---
     end_time = time.time()
+    total_nsfw_count = 0
+    with open(args.output_file, 'r', newline='', encoding='utf-8') as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            if row["Prediction"] == "NSFW":
+                total_nsfw_count += 1
+
     print("\n--- Detection Complete ---")
-    print(f"Total files processed: {total_files}")
+    print(f"Processed {files_processed_this_session} new files this session.")
     print(
-        f"Files classified as NSFW: {nsfw_count} (threshold >= {args.threshold})")
-    print(f"Total processing time: {end_time - start_time:.2f} seconds")
+        f"Total files in output: {len(processed_files) + files_processed_this_session}")
+    print(
+        f"Total NSFW files found in output: {total_nsfw_count} (threshold >= {args.threshold})")
+    print(
+        f"Processing time for this session: {end_time - start_time:.2f} seconds")
 
 
 if __name__ == "__main__":
