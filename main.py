@@ -112,31 +112,50 @@ worker_detector = None
 
 
 def analyze_image_batch(image_paths: list, detector: NsfwDetector):
-    """Analyzes a batch of images for NSFW content using the provided detector."""
-    batch_results = []
-    try:
-        images, valid_paths = [], []
-        for path in image_paths:
-            try:
-                img = Image.open(path).convert("RGB")
-                images.append(img)
-                valid_paths.append(path)
-            except Exception as e:
-                print(
-                    f"Warning: Could not open image {path}, skipping. Error: {e}")
-                batch_results.append({"path": path, "prob": -1.0})
-        if not images:
-            return batch_results
+    """
+    Analyzes a batch of images for NSFW content with a fallback to individual processing.
+    """
+    images, valid_paths, batch_results = [], [], []
+    for path in image_paths:
+        try:
+            img = Image.open(path).convert("RGB")
+            images.append(img)
+            valid_paths.append(path)
+        except Exception as e:
+            print(
+                f"Warning: Could not open image {path}, skipping. Error: {e}")
+            batch_results.append({"path": path, "prob": -1.0})  # 记录加载失败的文件
 
+    if not images:
+        return batch_results
+
+    try:
         nsfw_probs = detector.predict(images)
         for i, path in enumerate(valid_paths):
             batch_results.append({"path": path, "prob": nsfw_probs[i]})
+        return batch_results
+
     except Exception as e:
-        print(f"Error processing image batch: {e}\n{traceback.format_exc()}")
+        print(f"Warning: Batch processing failed. Error: {e}")
+        print("Retrying files in this batch individually...")
+
+        # Fallback to individual processing
+        batch_results = []
         for path in image_paths:
-            if not any(r['path'] == path for r in batch_results):
+            if path not in valid_paths:
                 batch_results.append({"path": path, "prob": -1.0})
-    return batch_results
+
+        for i, img in enumerate(images):
+            path = valid_paths[i]
+            try:
+                nsfw_prob = detector.predict([img])[0]
+                batch_results.append({"path": path, "prob": nsfw_prob})
+            except Exception as individual_e:
+                print(
+                    f"Error processing individual file {path} after batch failure. Error: {individual_e}")
+                batch_results.append({"path": path, "prob": -1.0})
+
+        return batch_results
 
 
 def _perform_video_analysis(video_path: str, detector: NsfwDetector) -> dict:
