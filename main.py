@@ -240,11 +240,11 @@ def main():
                         choices=DETECTOR_MAPPING.keys(), help="Name of the detector model to use.")
     parser.add_argument("--threshold", type=float, default=0.8,
                         help="Probability threshold to classify as NSFW (0.0 to 1.0).")
-    parser.add_argument("--batch-size", type=int, default=256,
+    parser.add_argument("--batch-size", type=int, default=128,
                         help="Number of images to process in a single batch on the GPU.")
     parser.add_argument("--image-workers", type=int, default=4,
                         help="Number of CPU cores for parallel image loading. Set to 0 to disable.")
-    parser.add_argument("--workers", type=int, default=8,
+    parser.add_argument("--workers", type=int, default=2,
                         help="Number of CPU cores for parallel video processing. Defaults to all available cores. Set to 0 to disable.")
     parser.add_argument("--no-cuda", action="store_true",
                         help="Disable CUDA and force CPU usage.")
